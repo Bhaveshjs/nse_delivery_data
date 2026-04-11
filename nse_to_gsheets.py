@@ -36,7 +36,7 @@ SCRIPS = [
 ]
 
 MARKET_START = dtime(9, 15)
-MARKET_END   = dtime(23, 45)
+MARKET_END   = dtime(15, 45)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS AUTH
