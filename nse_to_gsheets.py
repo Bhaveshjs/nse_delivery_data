@@ -20,6 +20,8 @@ import requests
 import gspread
 from datetime import datetime, time as dtime
 from google.oauth2.service_account import Credentials
+from zoneinfo import ZoneInfo
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ✏️  CONFIGURE YOUR SCRIPS HERE
@@ -174,7 +176,8 @@ def run():
         print(f"⏸  Outside market hours ({datetime.now().strftime('%H:%M')} IST). Exiting.")
         return
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    #timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S IST")
     print(f"🕐 Fetching at {timestamp}")
 
     # Connect to Google Sheets
