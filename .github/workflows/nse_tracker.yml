@@ -1,0 +1,51 @@
+# .github/workflows/nse_tracker.yml
+#
+# HOW TO USE:
+#   1. Put this file at: .github/workflows/nse_tracker.yml  in your repo
+#   2. Put nse_to_gsheets.py and requirements.txt at root of repo
+#   3. Add these two GitHub Secrets (Settings → Secrets → Actions):
+#        GOOGLE_CREDENTIALS_JSON  = paste entire contents of service account .json key
+#        GOOGLE_SHEET_ID          = the ID from your Google Sheet URL
+#   4. Push to GitHub — it will start running automatically!
+
+name: NSE Delivery Data Tracker
+
+on:
+  schedule:
+    # Runs every hour from 9 AM to 4 PM UTC+5:30 (IST)
+    # Cron is in UTC — IST is UTC+5:30
+    # 9:15 IST = 3:45 UTC | 15:45 IST = 10:15 UTC
+    - cron: '15 4 * * 1-5'   # 9:45  IST  Mon-Fri
+    - cron: '15 5 * * 1-5'   # 10:45 IST
+    - cron: '15 6 * * 1-5'   # 11:45 IST
+    - cron: '15 7 * * 1-5'   # 12:45 IST
+    - cron: '15 8 * * 1-5'   # 13:45 IST
+    - cron: '15 9 * * 1-5'   # 14:45 IST
+    - cron: '15 10 * * 1-5'  # 15:45 IST
+
+  # Also allow manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  fetch-nse-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run NSE tracker
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID:         ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python nse_to_gsheets.py
