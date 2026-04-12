@@ -269,9 +269,9 @@ def is_market_hours() -> bool:
 
 
 def run():
-    # if not is_market_hours():
-    #     print(f"Skipping — outside market hours ({datetime.now(IST).strftime('%H:%M')} IST).")
-    #     return
+    if not is_market_hours():
+        print(f"Skipping — outside market hours ({datetime.now(IST).strftime('%H:%M')} IST).")
+        return
 
     timestamp   = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     print(f"Fetching {len(SCRIPS)} scrips at {timestamp}")
