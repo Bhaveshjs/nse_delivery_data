@@ -1,13 +1,12 @@
 """
-NSE Delivery + Price Data → Google Sheets  (Single Sheet, Single API Call)
-===========================================================================
+NSE Delivery + Price Data → Google Sheets
+==========================================
 Fetches all Nifty 50 + Bank Nifty stocks every hour during market hours.
 All data goes into ONE sheet with Symbol and Index columns.
 
-Single API call per symbol:
-    /api/quote-equity?symbol=X
-    Returns: priceInfo (LTP, %change, VWAP) + securityWiseDP (delivery)
-             + marketDeptOrderBook.tradeInfo (volume/value for VWAP fallback)
+Two API calls per symbol:
+    Call 1: /api/quote-equity?symbol=X              → priceInfo (LTP, %change, VWAP)
+    Call 2: /api/quote-equity?symbol=X&section=trade_info → securityWiseDP (delivery)
 
 Columns:
     Timestamp | Symbol | Index | LTP | % Change | VWAP | Price vs VWAP |
@@ -24,11 +23,11 @@ GitHub Secrets needed:
 import os, json, time, requests, gspread
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-from google.oauth2.service_account import Credentials
 from urllib.parse import quote
+from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NIFTY 50 + BANK NIFTY  (deduplicated, with index labels)
+# NIFTY 50 + BANK NIFTY
 # ─────────────────────────────────────────────────────────────────────────────
 
 NIFTY50 = {
@@ -50,15 +49,13 @@ BANKNIFTY = {
     "KOTAKBANK", "PNB", "SBIN",
 }
 
-def index_label(symbol: str) -> str:
-    in_n = symbol in NIFTY50
-    in_b = symbol in BANKNIFTY
+def index_label(symbol):
+    in_n, in_b = symbol in NIFTY50, symbol in BANKNIFTY
     if in_n and in_b: return "Nifty50 + BankNifty"
     if in_n:          return "Nifty50"
     if in_b:          return "BankNifty"
     return "Other"
 
-# All unique symbols, Nifty50 first then BankNifty-only
 SCRIPS = sorted(NIFTY50) + sorted(BANKNIFTY - NIFTY50)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,9 +65,9 @@ SCRIPS = sorted(NIFTY50) + sorted(BANKNIFTY - NIFTY50)
 IST          = ZoneInfo("Asia/Kolkata")
 MARKET_START = dtime(9, 15)
 MARKET_END   = dtime(15, 45)
-SHEET_NAME   = "NSE Data"          # Single sheet name — change if you like
+SHEET_NAME   = "NSE Data"
 
-SHEET_HEADERS = [
+HEADERS = [
     "Timestamp (IST)",
     "Symbol",
     "Index",
@@ -105,16 +102,15 @@ def get_gsheet_client():
 
 
 def get_or_create_sheet(spreadsheet):
-    """Return the single 'NSE Data' worksheet, creating it if needed."""
+    """Return the single NSE Data worksheet, creating it with headers if needed."""
     try:
         ws = spreadsheet.worksheet(SHEET_NAME)
-        # Add header if sheet is blank
         if not ws.row_values(1):
-            ws.insert_row(SHEET_HEADERS, 1)
+            ws.insert_row(HEADERS, 1)
             _format_header(spreadsheet, ws)
     except gspread.exceptions.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=SHEET_NAME, rows=50000, cols=15)
-        ws.insert_row(SHEET_HEADERS, 1)
+        ws.insert_row(HEADERS, 1)
         _format_header(spreadsheet, ws)
     return ws
 
@@ -143,7 +139,7 @@ def _format_header(spreadsheet, ws):
 # NSE SESSION
 # ─────────────────────────────────────────────────────────────────────────────
 
-NSE_HEADERS = {
+NSE_HDRS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -154,105 +150,91 @@ NSE_HEADERS = {
     "Referer":         "https://www.nseindia.com/",
 }
 
-def get_nse_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update(NSE_HEADERS)
-    session.get("https://www.nseindia.com/", timeout=15)
-    time.sleep(2)
-    session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=15)
-    time.sleep(1)
-    return session
+def get_nse_session():
+    s = requests.Session()
+    s.headers.update(NSE_HDRS)
+    s.get("https://www.nseindia.com/", timeout=15);          time.sleep(2)
+    s.get("https://www.nseindia.com/market-data/live-equity-market", timeout=15); time.sleep(1)
+    return s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NSE DATA FETCH — single API call per symbol
-#
-# Endpoint: /api/quote-equity?symbol=X  (no section param)
-# Returns everything in one response:
-#   priceInfo.lastPrice          → LTP
-#   priceInfo.pChange            → % change
-#   priceInfo.vwap               → VWAP (direct from NSE — most accurate)
-#   securityWiseDP.*             → delivery data
-#   marketDeptOrderBook.tradeInfo→ volume/value (VWAP fallback if priceInfo.vwap missing)
-#
-# VWAP fallback formula (if NSE doesn't return it directly):
-#   NSE gives totalTradedVolume in LAKH shares, totalTradedValue in CRORES
-#   VWAP = (totalTradedValue_crore * 1,00,00,000) / (totalTradedVolume_lakh * 1,00,000)
-#         = (totalTradedValue / totalTradedVolume) * 100
+# NSE FETCH — 2 calls per symbol
+#   Call 1 → /api/quote-equity?symbol=X              → priceInfo (LTP, %change, VWAP)
+#   Call 2 → /api/quote-equity?symbol=X&section=trade_info → securityWiseDP (delivery)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_data(symbol: str, session: requests.Session) -> dict:
+def fetch_data(symbol, session):
     result = {
-        "ltp":             "N/A",
-        "pct_change":      "N/A",
-        "vwap":            "N/A",
-        "vs_vwap":         "N/A",
-        "qty_traded":      "N/A",
-        "deliverable_qty": "N/A",
-        "pct_deliverable": "N/A",
-        "as_of":           "",
-        "error":           None,
+        "ltp": "N/A", "pct_change": "N/A", "vwap": "N/A", "vs_vwap": "N/A",
+        "qty_traded": "N/A", "deliverable_qty": "N/A",
+        "pct_deliverable": "N/A", "as_of": "", "error": None,
     }
+    sym_enc = quote(symbol, safe="")
+
     try:
-        # URL-encode symbol (handles M&M → M%26M)
-        encoded = quote(symbol, safe="")
-        url     = f"https://www.nseindia.com/api/quote-equity?symbol={encoded}"
-        resp    = session.get(url, timeout=15)
+        # ── Call 1: price data ────────────────────────────────────────────────
+        r1 = session.get(
+            f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}",
+            timeout=15
+        )
+        if r1.status_code != 200:
+            result["error"] = f"Call1 HTTP {r1.status_code}"; return result
 
-        if resp.status_code != 200:
-            result["error"] = f"HTTP {resp.status_code}"
-            return result
+        pi         = r1.json().get("priceInfo", {})
+        ltp        = pi.get("lastPrice")
+        pct_change = pi.get("pChange")
+        vwap_nse   = pi.get("vwap")
 
-        data = resp.json()
+        ltp_f  = float(ltp)      if ltp      is not None else None
+        vwap_f = float(vwap_nse) if vwap_nse is not None else None
 
-        # ── Price info ────────────────────────────────────────────────────────
-        price_info = data.get("priceInfo", {})
-        ltp        = price_info.get("lastPrice")
-        pct_change = price_info.get("pChange")
-        vwap_nse   = price_info.get("vwap")         # NSE provides VWAP directly
-
-        ltp_float  = float(ltp)  if ltp        is not None else None
-        vwap_float = float(vwap_nse) if vwap_nse is not None else None
-
-        if ltp_float is not None:
-            result["ltp"] = f"{ltp_float:,.2f}"
-
+        if ltp_f is not None:
+            result["ltp"] = f"{ltp_f:,.2f}"
         if pct_change is not None:
-            sign = "+" if float(pct_change) >= 0 else ""
-            result["pct_change"] = f"{sign}{float(pct_change):.2f}%"
+            s = "+" if float(pct_change) >= 0 else ""
+            result["pct_change"] = f"{s}{float(pct_change):.2f}%"
+        if vwap_f is not None:
+            result["vwap"] = f"{vwap_f:.2f}"
 
-        # ── VWAP: use NSE value; calculate as fallback ─────────────────────
-        if vwap_float is not None:
-            result["vwap"] = f"{vwap_float:.2f}"
-        else:
-            # Fallback: calculate from totalTradedValue / totalTradedVolume
-            ti        = data.get("marketDeptOrderBook", {}).get("tradeInfo", {})
-            vol_lakh  = ti.get("totalTradedVolume")
-            val_crore = ti.get("totalTradedValue")
-            if vol_lakh and val_crore and float(vol_lakh) > 0:
-                vwap_float     = (float(val_crore) * 1e7) / (float(vol_lakh) * 1e5)
-                result["vwap"] = f"{vwap_float:.2f}"
+        time.sleep(0.4)
 
-        # ── Above / Below VWAP ────────────────────────────────────────────────
-        if ltp_float is not None and vwap_float is not None:
-            diff = ltp_float - vwap_float
-            if diff > 0:
-                result["vs_vwap"] = f"ABOVE (+{diff:.2f})"
-            elif diff < 0:
-                result["vs_vwap"] = f"BELOW (-{abs(diff):.2f})"
-            else:
-                result["vs_vwap"] = "AT VWAP"
+        # ── Call 2: delivery data ─────────────────────────────────────────────
+        r2 = session.get(
+            f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}&section=trade_info",
+            timeout=15
+        )
+        if r2.status_code != 200:
+            result["error"] = f"Call2 HTTP {r2.status_code}"; return result
 
-        # ── Delivery info ─────────────────────────────────────────────────────
-        dp = data.get("securityWiseDP", {})
-        qty_traded      = dp.get("quantityTraded")
-        deliverable_qty = dp.get("deliveryQuantity")
-        pct_deliverable = dp.get("deliveryToTradedQuantity")
-        result["as_of"] = dp.get("secWiseDelPosDate", "")
+        data2 = r2.json()
+        dp    = data2.get("securityWiseDP", {})
+        ti    = data2.get("marketDeptOrderBook", {}).get("tradeInfo", {})
 
-        result["qty_traded"]      = f"{int(qty_traded):,}"      if qty_traded      is not None else "N/A"
-        result["deliverable_qty"] = f"{int(deliverable_qty):,}" if deliverable_qty is not None else "N/A"
-        result["pct_deliverable"] = f"{float(pct_deliverable):.2f}%" if pct_deliverable is not None else "N/A"
+        qt  = dp.get("quantityTraded")
+        dq  = dp.get("deliveryQuantity")
+        pct = dp.get("deliveryToTradedQuantity")
+        result["as_of"]           = dp.get("secWiseDelPosDate", "")
+        result["qty_traded"]      = f"{int(qt):,}"       if qt  is not None else "N/A"
+        result["deliverable_qty"] = f"{int(dq):,}"       if dq  is not None else "N/A"
+        result["pct_deliverable"] = f"{float(pct):.2f}%" if pct is not None else "N/A"
+
+        # VWAP fallback from tradeInfo if priceInfo didn't have it
+        if vwap_f is None:
+            vol = ti.get("totalTradedVolume")
+            val = ti.get("totalTradedValue")
+            if vol and val and float(vol) > 0:
+                vwap_f         = (float(val) * 1e7) / (float(vol) * 1e5)
+                result["vwap"] = f"{vwap_f:.2f}"
+
+        # Above / Below VWAP
+        if ltp_f is not None and vwap_f is not None:
+            diff = ltp_f - vwap_f
+            result["vs_vwap"] = (
+                f"ABOVE (+{diff:.2f})"      if diff > 0 else
+                f"BELOW (-{abs(diff):.2f})" if diff < 0 else
+                "AT VWAP"
+            )
 
     except Exception as e:
         result["error"] = str(e)
@@ -264,7 +246,7 @@ def fetch_data(symbol: str, session: requests.Session) -> dict:
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def is_market_hours() -> bool:
+def is_market_hours():
     return MARKET_START <= datetime.now(IST).time() <= MARKET_END
 
 
@@ -274,49 +256,38 @@ def run():
         return
 
     timestamp   = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    print(f"\n{'='*60}")
     print(f"Fetching {len(SCRIPS)} scrips at {timestamp}")
-    print(f"Nifty50={len(NIFTY50)}  BankNifty={len(BANKNIFTY)}  "
-          f"BankNifty-only={len(BANKNIFTY - NIFTY50)}")
+    print(f"{'='*60}")
 
     gc          = get_gsheet_client()
     spreadsheet = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
     ws          = get_or_create_sheet(spreadsheet)
-    nse_session = get_nse_session()
+    nse         = get_nse_session()
 
-    rows_to_append = []
-
+    rows = []
     for symbol in SCRIPS:
-        print(f"   {symbol:<15} ... ", end="", flush=True)
-        data = fetch_data(symbol, nse_session)
-
+        print(f"  {symbol:<15} ", end="", flush=True)
+        d   = fetch_data(symbol, nse)
         row = [
-            timestamp,
-            symbol,
-            index_label(symbol),
-            data["ltp"],
-            data["pct_change"],
-            data["vwap"],
-            data["vs_vwap"],
-            data["qty_traded"],
-            data["deliverable_qty"],
-            data["pct_deliverable"],
-            data["as_of"],
-            data.get("error") or "OK",
+            timestamp, symbol, index_label(symbol),
+            d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
+            d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
+            d["as_of"], d.get("error") or "OK",
         ]
-        rows_to_append.append(row)
+        rows.append(row)
 
-        if data["error"]:
-            print(f"ERROR — {data['error']}")
+        if d["error"]:
+            print(f"ERROR — {d['error']}")
         else:
-            print(
-                f"LTP={data['ltp']}  ({data['pct_change']})  "
-                f"VWAP={data['vwap']}  {data['vs_vwap']}"
-            )
-        time.sleep(0.5)   # be gentle with NSE
+            print(f"LTP={d['ltp']:>10}  {d['pct_change']:>8}  "
+                  f"VWAP={d['vwap']:>10}  {d['vs_vwap']}")
+        time.sleep(0.5)
 
-    # Batch append all rows in one Sheets API call — faster + fewer quota hits
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-    print(f"\nDone. {len(rows_to_append)} rows written to '{SHEET_NAME}' tab.")
+    # Batch append all rows in one Sheets API call
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"\n{len(rows)} rows written to '{SHEET_NAME}' tab.")
+    print(f"Done at {datetime.now(IST).strftime('%H:%M:%S IST')}")
 
 
 if __name__ == "__main__":
