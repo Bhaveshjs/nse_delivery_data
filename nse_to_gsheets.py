@@ -1,22 +1,24 @@
 """
 NSE Delivery + Price Data → Google Sheets
 ==========================================
-Fetches all Nifty 50 + Bank Nifty stocks every hour during market hours.
-All data goes into ONE sheet with Symbol and Index columns.
+Writes to TWO sheets every run:
 
-Two API calls per symbol:
-    Call 1: /api/quote-equity?symbol=X              → priceInfo (LTP, %change, VWAP)
-    Call 2: /api/quote-equity?symbol=X&section=trade_info → securityWiseDP (delivery)
+  Tab 1 "Raw Data"        — every fetch appended chronologically (full history)
+  Tab 2 "Latest Snapshot" — one row per symbol, overwritten each run + Signal column
 
-Columns:
-    Timestamp | Symbol | Index | LTP | % Change | VWAP | Price vs VWAP |
-    Qty Traded | Deliverable Qty | % Deliverable | As Of Date | Remarks
+Signal logic:
+    STRONG BUY     : Price ABOVE VWAP + Delivery > 60% + % change positive
+    ACCUMULATION   : Price BELOW VWAP + Delivery > 60% (buying despite weakness)
+    DISTRIBUTION   : Price ABOVE VWAP + Delivery > 60% + % change negative
+    SPECULATIVE    : Price ABOVE VWAP + Delivery < 40% (no real buying conviction)
+    WEAK / AVOID   : Price BELOW VWAP + Delivery < 40% + % change negative
+    NEUTRAL        : Everything else
 
 Setup:
     pip install requests gspread google-auth
 
-GitHub Secrets needed:
-    GOOGLE_CREDENTIALS_JSON  — full contents of service account JSON key
+GitHub Secrets:
+    GOOGLE_CREDENTIALS_JSON  — service account JSON key (full contents)
     GOOGLE_SHEET_ID          — ID from Google Sheet URL (/d/<THIS>/edit)
 """
 
@@ -39,8 +41,8 @@ NIFTY50 = {
     "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
     "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
     "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
-    "SUNPHARMA", "TATACONSUM", "TMPV", "TCS",
-    "TECHM", "TITAN", "ULTRACEMCO", "WIPRO", "ETERNAL","TATASTEEL"
+    "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
+    "TECHM", "TITAN", "ULTRACEMCO", "WIPRO", "ZOMATO",
 }
 
 BANKNIFTY = {
@@ -62,25 +64,67 @@ SCRIPS = sorted(NIFTY50) + sorted(BANKNIFTY - NIFTY50)
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-IST          = ZoneInfo("Asia/Kolkata")
-MARKET_START = dtime(9, 15)
-MARKET_END   = dtime(15, 45)
-SHEET_NAME   = "NSE Data"
+IST              = ZoneInfo("Asia/Kolkata")
+MARKET_START     = dtime(9, 15)
+MARKET_END       = dtime(15, 45)
 
-HEADERS = [
-    "Timestamp (IST)",
-    "Symbol",
-    "Index",
-    "LTP (Rs.)",
-    "% Change",
-    "VWAP (Rs.)",
-    "Price vs VWAP",
-    "Quantity Traded",
-    "Deliverable Quantity (Gross)",
-    "% Deliverable to Traded Qty",
-    "As Of Date (NSE)",
-    "Remarks",
+RAW_SHEET        = "Raw Data"
+SNAPSHOT_SHEET   = "Latest Snapshot"
+
+# Delivery % thresholds for signals
+HIGH_DELIVERY    = 60.0
+LOW_DELIVERY     = 40.0
+
+RAW_HEADERS = [
+    "Timestamp (IST)", "Symbol", "Index",
+    "LTP (Rs.)", "% Change", "VWAP (Rs.)", "Price vs VWAP",
+    "Quantity Traded", "Deliverable Quantity (Gross)",
+    "% Deliverable to Traded Qty", "As Of Date (NSE)", "Remarks",
 ]
+
+SNAPSHOT_HEADERS = [
+    "Symbol", "Index", "Signal",
+    "LTP (Rs.)", "% Change", "VWAP (Rs.)", "Price vs VWAP",
+    "Quantity Traded", "Deliverable Quantity (Gross)",
+    "% Deliverable to Traded Qty", "As Of Date (NSE)",
+    "Last Updated (IST)",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_signal(d: dict) -> str:
+    """
+    Returns one of: STRONG BUY | ACCUMULATION | DISTRIBUTION |
+                    SPECULATIVE RALLY | WEAK - AVOID | NEUTRAL
+    based on VWAP position, delivery %, and % change.
+    """
+    try:
+        vs      = d.get("vs_vwap", "")
+        pct_del = d.get("pct_deliverable_raw", None)   # raw float
+        pct_chg = d.get("pct_change_raw", None)        # raw float
+
+        if pct_del is None or vs == "N/A":
+            return "NEUTRAL"
+
+        above   = "ABOVE" in vs
+        below   = "BELOW" in vs
+        high_d  = pct_del >= HIGH_DELIVERY
+        low_d   = pct_del <  LOW_DELIVERY
+        up      = pct_chg is not None and pct_chg >= 0
+        down    = pct_chg is not None and pct_chg <  0
+
+        if above and high_d and up:   return "STRONG BUY"
+        if above and high_d and down: return "DISTRIBUTION"
+        if below and high_d:          return "ACCUMULATION"
+        if above and low_d:           return "SPECULATIVE RALLY"
+        if below and low_d and down:  return "WEAK - AVOID"
+        return "NEUTRAL"
+
+    except Exception:
+        return "NEUTRAL"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE SHEETS
@@ -90,6 +134,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# Signal → background colour (RGB 0-1 for Sheets API)
+SIGNAL_COLORS = {
+    "STRONG BUY":       {"red": 0.60, "green": 0.88, "blue": 0.60},  # green
+    "ACCUMULATION":     {"red": 0.67, "green": 0.88, "blue": 1.00},  # blue
+    "DISTRIBUTION":     {"red": 1.00, "green": 0.73, "blue": 0.40},  # orange
+    "SPECULATIVE RALLY":{"red": 1.00, "green": 0.97, "blue": 0.60},  # yellow
+    "WEAK - AVOID":     {"red": 1.00, "green": 0.60, "blue": 0.60},  # red
+    "NEUTRAL":          {"red": 0.95, "green": 0.95, "blue": 0.95},  # light gray
+}
 
 def get_gsheet_client():
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -101,42 +155,95 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 
-def get_or_create_sheet(spreadsheet):
-    """Return the single NSE Data worksheet, creating it with headers if needed."""
+def get_or_create_ws(spreadsheet, title, headers):
+    """Get or create a worksheet, writing headers if brand new."""
     try:
-        ws = spreadsheet.worksheet(SHEET_NAME)
+        ws = spreadsheet.worksheet(title)
         if not ws.row_values(1):
-            ws.insert_row(HEADERS, 1)
-            _format_header(spreadsheet, ws)
+            ws.insert_row(headers, 1)
+            _fmt_header(spreadsheet, ws, len(headers))
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=SHEET_NAME, rows=50000, cols=15)
-        ws.insert_row(HEADERS, 1)
-        _format_header(spreadsheet, ws)
+        ws = spreadsheet.add_worksheet(title=title, rows=50000, cols=len(headers) + 2)
+        ws.insert_row(headers, 1)
+        _fmt_header(spreadsheet, ws, len(headers))
     return ws
 
 
-def _format_header(spreadsheet, ws):
+def _fmt_header(spreadsheet, ws, num_cols):
+    """Dark blue header, white bold text."""
     spreadsheet.batch_update({"requests": [{
         "repeatCell": {
-            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1},
-            "cell": {
-                "userEnteredFormat": {
-                    "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
-                    "textFormat": {
-                        "bold": True,
-                        "foregroundColor": {"red": 1, "green": 1, "blue": 1},
-                        "fontSize": 10,
-                    },
-                    "horizontalAlignment": "CENTER",
-                }
-            },
+            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": num_cols},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.12, "green": 0.31, "blue": 0.47},
+                "textFormat": {"bold": True, "foregroundColor": {"red":1,"green":1,"blue":1}, "fontSize": 10},
+                "horizontalAlignment": "CENTER",
+            }},
             "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
         }
     }]})
 
 
+def colour_snapshot_rows(spreadsheet, ws, data_by_symbol):
+    """
+    Colour each row in the Snapshot sheet based on its signal.
+    Reads current row positions by matching Symbol column.
+    """
+    try:
+        all_values = ws.get_all_values()
+        requests   = []
+        for row_idx, row in enumerate(all_values[1:], start=1):   # skip header
+            if not row: continue
+            symbol = row[0]
+            signal = data_by_symbol.get(symbol, {}).get("signal", "NEUTRAL")
+            color  = SIGNAL_COLORS.get(signal, SIGNAL_COLORS["NEUTRAL"])
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId":          ws.id,
+                        "startRowIndex":    row_idx,
+                        "endRowIndex":      row_idx + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex":   len(SNAPSHOT_HEADERS),
+                    },
+                    "cell": {"userEnteredFormat": {
+                        "backgroundColor": color,
+                        "horizontalAlignment": "CENTER",
+                    }},
+                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment)"
+                }
+            })
+        if requests:
+            spreadsheet.batch_update({"requests": requests})
+    except Exception as e:
+        print(f"   Warning: could not colour snapshot rows: {e}")
+
+
+def update_snapshot(spreadsheet, ws, snapshot_rows, data_by_symbol):
+    """
+    Overwrite snapshot sheet: clear data rows, rewrite all symbols sorted by signal priority.
+    """
+    signal_order = ["STRONG BUY", "ACCUMULATION", "DISTRIBUTION",
+                    "SPECULATIVE RALLY", "WEAK - AVOID", "NEUTRAL"]
+
+    snapshot_rows.sort(key=lambda r: (
+        signal_order.index(r[2]) if r[2] in signal_order else 99,
+        r[0]   # then alphabetically by symbol
+    ))
+
+    # Clear everything below header
+    ws.batch_clear(["A2:Z50000"])
+    time.sleep(1)
+
+    if snapshot_rows:
+        ws.append_rows(snapshot_rows, value_input_option="USER_ENTERED")
+        time.sleep(1)
+        colour_snapshot_rows(spreadsheet, ws, data_by_symbol)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# NSE SESSION
+# NSE SESSION + FETCH
 # ─────────────────────────────────────────────────────────────────────────────
 
 NSE_HDRS = {
@@ -158,22 +265,19 @@ def get_nse_session():
     return s
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NSE FETCH — 2 calls per symbol
-#   Call 1 → /api/quote-equity?symbol=X              → priceInfo (LTP, %change, VWAP)
-#   Call 2 → /api/quote-equity?symbol=X&section=trade_info → securityWiseDP (delivery)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def fetch_data(symbol, session):
     result = {
         "ltp": "N/A", "pct_change": "N/A", "vwap": "N/A", "vs_vwap": "N/A",
         "qty_traded": "N/A", "deliverable_qty": "N/A",
-        "pct_deliverable": "N/A", "as_of": "", "error": None,
+        "pct_deliverable": "N/A", "as_of": "",
+        # raw floats for signal engine
+        "pct_change_raw": None, "pct_deliverable_raw": None,
+        "error": None,
     }
     sym_enc = quote(symbol, safe="")
 
     try:
-        # ── Call 1: price data ────────────────────────────────────────────────
+        # Call 1: price data
         r1 = session.get(
             f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}",
             timeout=15
@@ -189,17 +293,16 @@ def fetch_data(symbol, session):
         ltp_f  = float(ltp)      if ltp      is not None else None
         vwap_f = float(vwap_nse) if vwap_nse is not None else None
 
-        if ltp_f is not None:
-            result["ltp"] = f"{ltp_f:,.2f}"
+        if ltp_f is not None:      result["ltp"]             = f"{ltp_f:,.2f}"
         if pct_change is not None:
-            s = "+" if float(pct_change) >= 0 else ""
-            result["pct_change"] = f"{s}{float(pct_change):.2f}%"
-        if vwap_f is not None:
-            result["vwap"] = f"{vwap_f:.2f}"
+            pcf = float(pct_change)
+            result["pct_change"]     = f"{'+' if pcf>=0 else ''}{pcf:.2f}%"
+            result["pct_change_raw"] = pcf
+        if vwap_f is not None:     result["vwap"]            = f"{vwap_f:.2f}"
 
         time.sleep(0.4)
 
-        # ── Call 2: delivery data ─────────────────────────────────────────────
+        # Call 2: delivery data
         r2 = session.get(
             f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}&section=trade_info",
             timeout=15
@@ -214,12 +317,16 @@ def fetch_data(symbol, session):
         qt  = dp.get("quantityTraded")
         dq  = dp.get("deliveryQuantity")
         pct = dp.get("deliveryToTradedQuantity")
-        result["as_of"]           = dp.get("secWiseDelPosDate", "")
-        result["qty_traded"]      = f"{int(qt):,}"       if qt  is not None else "N/A"
-        result["deliverable_qty"] = f"{int(dq):,}"       if dq  is not None else "N/A"
-        result["pct_deliverable"] = f"{float(pct):.2f}%" if pct is not None else "N/A"
 
-        # VWAP fallback from tradeInfo if priceInfo didn't have it
+        result["as_of"]              = dp.get("secWiseDelPosDate", "")
+        result["qty_traded"]         = f"{int(qt):,}"       if qt  is not None else "N/A"
+        result["deliverable_qty"]    = f"{int(dq):,}"       if dq  is not None else "N/A"
+        if pct is not None:
+            pctf = float(pct)
+            result["pct_deliverable"]     = f"{pctf:.2f}%"
+            result["pct_deliverable_raw"] = pctf
+
+        # VWAP fallback
         if vwap_f is None:
             vol = ti.get("totalTradedVolume")
             val = ti.get("totalTradedValue")
@@ -255,39 +362,66 @@ def run():
         print(f"Skipping — outside market hours ({datetime.now(IST).strftime('%H:%M')} IST).")
         return
 
-    timestamp   = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    print(f"\n{'='*60}")
+    timestamp = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    print(f"\n{'='*62}")
     print(f"Fetching {len(SCRIPS)} scrips at {timestamp}")
-    print(f"{'='*60}")
+    print(f"{'='*62}")
 
-    gc          = get_gsheet_client()
-    spreadsheet = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
-    ws          = get_or_create_sheet(spreadsheet)
-    nse         = get_nse_session()
+    gc           = get_gsheet_client()
+    spreadsheet  = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
+    ws_raw       = get_or_create_ws(spreadsheet, RAW_SHEET,      RAW_HEADERS)
+    ws_snap      = get_or_create_ws(spreadsheet, SNAPSHOT_SHEET, SNAPSHOT_HEADERS)
+    nse          = get_nse_session()
 
-    rows = []
+    raw_rows      = []
+    snapshot_rows = []
+    data_by_symbol = {}
+
     for symbol in SCRIPS:
         print(f"  {symbol:<15} ", end="", flush=True)
-        d   = fetch_data(symbol, nse)
-        row = [
+        d      = fetch_data(symbol, nse)
+        signal = compute_signal(d)
+        data_by_symbol[symbol] = {**d, "signal": signal}
+
+        # Row for Raw Data tab
+        raw_rows.append([
             timestamp, symbol, index_label(symbol),
             d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
             d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
             d["as_of"], d.get("error") or "OK",
-        ]
-        rows.append(row)
+        ])
 
-        if d["error"]:
-            print(f"ERROR — {d['error']}")
-        else:
-            print(f"LTP={d['ltp']:>10}  {d['pct_change']:>8}  "
-                  f"VWAP={d['vwap']:>10}  {d['vs_vwap']}")
+        # Row for Latest Snapshot tab
+        snapshot_rows.append([
+            symbol, index_label(symbol), signal,
+            d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
+            d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
+            d["as_of"], timestamp,
+        ])
+
+        print(f"[{signal:<18}]  LTP={d['ltp']:>10}  {d['pct_change']:>8}  "
+              f"Deliv%={d['pct_deliverable']:>7}  {d['vs_vwap']}")
         time.sleep(0.5)
 
-    # Batch append all rows in one Sheets API call
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"\n{len(rows)} rows written to '{SHEET_NAME}' tab.")
-    print(f"Done at {datetime.now(IST).strftime('%H:%M:%S IST')}")
+    print(f"\nWriting to Google Sheets...")
+
+    # Tab 1: append to Raw Data
+    ws_raw.append_rows(raw_rows, value_input_option="USER_ENTERED")
+    print(f"  Raw Data      : {len(raw_rows)} rows appended")
+
+    # Tab 2: overwrite Snapshot with sorted + coloured data
+    update_snapshot(spreadsheet, ws_snap, snapshot_rows, data_by_symbol)
+    print(f"  Latest Snapshot: {len(snapshot_rows)} rows updated + colour coded")
+
+    # Print signal summary
+    from collections import Counter
+    counts = Counter(data_by_symbol[s]["signal"] for s in SCRIPS)
+    print(f"\nSignal summary:")
+    for sig in ["STRONG BUY","ACCUMULATION","DISTRIBUTION","SPECULATIVE RALLY","WEAK - AVOID","NEUTRAL"]:
+        if counts.get(sig, 0) > 0:
+            print(f"  {sig:<20} : {counts[sig]} stocks")
+
+    print(f"\nDone at {datetime.now(IST).strftime('%H:%M:%S IST')}")
 
 
 if __name__ == "__main__":
