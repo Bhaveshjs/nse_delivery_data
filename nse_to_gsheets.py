@@ -15,17 +15,28 @@ Signal logic:
     NEUTRAL        : Everything else
 
 Setup:
-    pip install requests gspread google-auth
+    pip install "nse[local,server]" gspread google-auth
+    # installing both extras means one install works whether you run this
+    # locally or on GitHub Actions — the script auto-detects which to use.
 
-GitHub Secrets:
+Credentials (either works, checked in this order):
+    1. Environment variables (used automatically on GitHub Actions via secrets):
+         GOOGLE_CREDENTIALS_JSON  — service account JSON key (full contents)
+         GOOGLE_SHEET_ID          — ID from Google Sheet URL (/d/<THIS>/edit)
+    2. Local files sitting next to this script (used automatically for local runs
+       if the env vars above are not set):
+         credentials.json  — the service account JSON key file, saved as-is
+         sheet_id.txt      — a plain text file containing just the Sheet ID
+
+GitHub Secrets (for the Actions workflow):
     GOOGLE_CREDENTIALS_JSON  — service account JSON key (full contents)
     GOOGLE_SHEET_ID          — ID from Google Sheet URL (/d/<THIS>/edit)
 """
 
-import os, json, time, requests, gspread
+import os, json, time, gspread
+from nse import NSE  # actively-maintained NSE client that handles Akamai bot-protection cookies internally
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
 from google.oauth2.service_account import Credentials
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,8 +52,8 @@ from google.oauth2.service_account import Credentials
 #     "INFY", "ITC", "JSWSTEEL", "KOTAKBANK", "LT",
 #     "M&M", "MARUTI", "NESTLEIND", "NTPC", "ONGC",
 #     "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN",
-#     "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS",
-#     "TECHM", "TITAN", "ULTRACEMCO", "WIPRO", "ETERNAL",
+#     "SUNPHARMA", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TCS",
+#     "TECHM", "TITAN", "ULTRACEMCO", "WIPRO", "ZOMATO",
 # }
 
 # BANKNIFTY = {
@@ -153,14 +164,49 @@ SIGNAL_COLORS = {
     "NEUTRAL":          {"red": 0.95, "green": 0.95, "blue": 0.95},  # light gray
 }
 
+CREDENTIALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+SHEET_ID_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sheet_id.txt")
+
 def get_gsheet_client():
+    """
+    Loads Google service account credentials from (in priority order):
+      1. GOOGLE_CREDENTIALS_JSON env var (used on GitHub Actions via secrets)
+      2. A local credentials.json file sitting next to this script (for local runs)
+    """
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if not creds_json:
-        raise EnvironmentError("GOOGLE_CREDENTIALS_JSON env var not set.")
-    creds = Credentials.from_service_account_info(
-        json.loads(creds_json), scopes=SCOPES
-    )
+    if creds_json:
+        creds_dict = json.loads(creds_json)
+    elif os.path.exists(CREDENTIALS_FILE):
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+            creds_dict = json.load(f)
+    else:
+        raise EnvironmentError(
+            "No Google credentials found. Either set the GOOGLE_CREDENTIALS_JSON "
+            f"env var, or place your service account key file at:\n  {CREDENTIALS_FILE}"
+        )
+
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
+
+
+def get_sheet_id():
+    """
+    Loads the Google Sheet ID from (in priority order):
+      1. GOOGLE_SHEET_ID env var (used on GitHub Actions via secrets)
+      2. A local sheet_id.txt file sitting next to this script (for local runs)
+    """
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    if sheet_id:
+        return sheet_id.strip()
+    if os.path.exists(SHEET_ID_FILE):
+        with open(SHEET_ID_FILE, "r", encoding="utf-8") as f:
+            sheet_id = f.read().strip()
+        if sheet_id:
+            return sheet_id
+    raise EnvironmentError(
+        "No Google Sheet ID found. Either set the GOOGLE_SHEET_ID env var, "
+        f"or place the sheet ID as plain text in:\n  {SHEET_ID_FILE}"
+    )
 
 
 def get_or_create_ws(spreadsheet, title, headers):
@@ -254,26 +300,22 @@ def update_snapshot(spreadsheet, ws, snapshot_rows, data_by_symbol):
 # NSE SESSION + FETCH
 # ─────────────────────────────────────────────────────────────────────────────
 
-NSE_HDRS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer":         "https://www.nseindia.com/",
-}
+# Cookies get cached here between runs (the `nse` library handles the Akamai
+# bot-protection handshake and stores/reuses cookies from this folder).
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def get_nse_session():
-    s = requests.Session()
-    s.headers.update(NSE_HDRS)
-    s.get("https://www.nseindia.com/", timeout=15);          time.sleep(2)
-    s.get("https://www.nseindia.com/market-data/live-equity-market", timeout=15); time.sleep(1)
-    return s
+# GitHub Actions always sets GITHUB_ACTIONS=true on its runners, so we can
+# auto-detect whether we're running "on a server" (cloud) vs locally, and use
+# the transport the `nse` library recommends for each (httpx/http2 for cloud,
+# requests for local) without you having to configure anything.
+IS_SERVER = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
 
-def fetch_data(symbol, session):
+def get_nse_client():
+    return NSE(download_folder=SCRIPT_DIR, server=IS_SERVER)
+
+
+def fetch_data(symbol, nse_client):
     result = {
         "ltp": "N/A", "pct_change": "N/A", "vwap": "N/A", "vs_vwap": "N/A",
         "qty_traded": "N/A", "deliverable_qty": "N/A",
@@ -282,65 +324,38 @@ def fetch_data(symbol, session):
         "pct_change_raw": None, "pct_deliverable_raw": None,
         "error": None,
     }
-    sym_enc = quote(symbol, safe="")
 
     try:
-        # Call 1: price data
-        r1 = session.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}",
-            timeout=15
-        )
-        if r1.status_code != 200:
-            result["error"] = f"Call1 HTTP {r1.status_code}"; return result
+        q = nse_client.quote(symbol)
 
-        pi         = r1.json().get("priceInfo", {})
-        ltp        = pi.get("lastPrice")
-        pct_change = pi.get("pChange")
-        vwap_nse   = pi.get("vwap")
+        meta  = q.get("metaData", {})
+        trade = q.get("tradeInfo", {})
+
+        ltp        = trade.get("lastPrice")
+        pct_change = meta.get("pChange")
+        vwap_nse   = meta.get("averagePrice")   # NSE's day VWAP-equivalent
+        qt         = trade.get("quantitytraded")
+        dq         = trade.get("deliveryquantity")
+        pct        = trade.get("deliveryToTradedQuantity")
+
+        result["as_of"] = trade.get("secwisedelposdate", "")
 
         ltp_f  = float(ltp)      if ltp      is not None else None
         vwap_f = float(vwap_nse) if vwap_nse is not None else None
 
-        if ltp_f is not None:      result["ltp"]             = f"{ltp_f:,.2f}"
+        if ltp_f is not None:      result["ltp"]  = f"{ltp_f:,.2f}"
         if pct_change is not None:
             pcf = float(pct_change)
             result["pct_change"]     = f"{'+' if pcf>=0 else ''}{pcf:.2f}%"
             result["pct_change_raw"] = pcf
-        if vwap_f is not None:     result["vwap"]            = f"{vwap_f:.2f}"
+        if vwap_f is not None:      result["vwap"] = f"{vwap_f:.2f}"
 
-        time.sleep(0.4)
-
-        # Call 2: delivery data
-        r2 = session.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={sym_enc}&section=trade_info",
-            timeout=15
-        )
-        if r2.status_code != 200:
-            result["error"] = f"Call2 HTTP {r2.status_code}"; return result
-
-        data2 = r2.json()
-        dp    = data2.get("securityWiseDP", {})
-        ti    = data2.get("marketDeptOrderBook", {}).get("tradeInfo", {})
-
-        qt  = dp.get("quantityTraded")
-        dq  = dp.get("deliveryQuantity")
-        pct = dp.get("deliveryToTradedQuantity")
-
-        result["as_of"]              = dp.get("secWiseDelPosDate", "")
-        result["qty_traded"]         = f"{int(qt):,}"       if qt  is not None else "N/A"
-        result["deliverable_qty"]    = f"{int(dq):,}"       if dq  is not None else "N/A"
+        result["qty_traded"]      = f"{int(qt):,}" if qt is not None else "N/A"
+        result["deliverable_qty"] = f"{int(dq):,}" if dq is not None else "N/A"
         if pct is not None:
             pctf = float(pct)
             result["pct_deliverable"]     = f"{pctf:.2f}%"
             result["pct_deliverable_raw"] = pctf
-
-        # VWAP fallback
-        if vwap_f is None:
-            vol = ti.get("totalTradedVolume")
-            val = ti.get("totalTradedValue")
-            if vol and val and float(vol) > 0:
-                vwap_f         = (float(val) * 1e7) / (float(vol) * 1e5)
-                result["vwap"] = f"{vwap_f:.2f}"
 
         # Above / Below VWAP
         if ltp_f is not None and vwap_f is not None:
@@ -376,40 +391,43 @@ def run():
     print(f"{'='*62}")
 
     gc           = get_gsheet_client()
-    spreadsheet  = gc.open_by_key(os.environ["GOOGLE_SHEET_ID"])
+    spreadsheet  = gc.open_by_key(get_sheet_id())
     ws_raw       = get_or_create_ws(spreadsheet, RAW_SHEET,      RAW_HEADERS)
     ws_snap      = get_or_create_ws(spreadsheet, SNAPSHOT_SHEET, SNAPSHOT_HEADERS)
-    nse          = get_nse_session()
+    nse_client   = get_nse_client()
 
     raw_rows      = []
     snapshot_rows = []
     data_by_symbol = {}
 
-    for symbol in SCRIPS:
-        print(f"  {symbol:<15} ", end="", flush=True)
-        d      = fetch_data(symbol, nse)
-        signal = compute_signal(d)
-        data_by_symbol[symbol] = {**d, "signal": signal}
+    try:
+        for symbol in SCRIPS:
+            print(f"  {symbol:<15} ", end="", flush=True)
+            d      = fetch_data(symbol, nse_client)
+            signal = compute_signal(d)
+            data_by_symbol[symbol] = {**d, "signal": signal}
 
-        # Row for Raw Data tab
-        raw_rows.append([
-            timestamp, symbol, index_label(symbol),
-            d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
-            d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
-            d["as_of"], d.get("error") or "OK",
-        ])
+            # Row for Raw Data tab
+            raw_rows.append([
+                timestamp, symbol, index_label(symbol),
+                d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
+                d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
+                d["as_of"], d.get("error") or "OK",
+            ])
 
-        # Row for Latest Snapshot tab
-        snapshot_rows.append([
-            symbol, index_label(symbol), signal,
-            d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
-            d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
-            d["as_of"], timestamp,
-        ])
+            # Row for Latest Snapshot tab
+            snapshot_rows.append([
+                symbol, index_label(symbol), signal,
+                d["ltp"], d["pct_change"], d["vwap"], d["vs_vwap"],
+                d["qty_traded"], d["deliverable_qty"], d["pct_deliverable"],
+                d["as_of"], timestamp,
+            ])
 
-        print(f"[{signal:<18}]  LTP={d['ltp']:>10}  {d['pct_change']:>8}  "
-              f"Deliv%={d['pct_deliverable']:>7}  {d['vs_vwap']}")
-        time.sleep(0.5)
+            print(f"[{signal:<18}]  LTP={d['ltp']:>10}  {d['pct_change']:>8}  "
+                  f"Deliv%={d['pct_deliverable']:>7}  {d['vs_vwap']}")
+            time.sleep(0.5)
+    finally:
+        nse_client.exit()  # always close the NSE session, even if a fetch raised
 
     print(f"\nWriting to Google Sheets...")
 
