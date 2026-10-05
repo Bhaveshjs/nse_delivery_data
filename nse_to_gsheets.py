@@ -14,6 +14,8 @@ Signal logic:
     WEAK / AVOID   : Price BELOW VWAP + Delivery < 40% + % change negative
     NEUTRAL        : Everything else
 
+    Now it updates all the FnO stocks - 250+ stocks
+
 Setup:
     pip install "nse[local,server]" gspread google-auth
     # installing both extras means one install works whether you run this
